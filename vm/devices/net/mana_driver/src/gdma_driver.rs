@@ -215,19 +215,19 @@ impl<T: DeviceBacking> Drop for GdmaDriver<T> {
         self.bar0.mem.write_u32(
             self.bar0.map.vf_gdma_sriov_shared_reg_start as usize + 28,
             hdr,
-        ); 
+        );
 
         // Wait for the device to respond.
         const log_ctx: &str = "After GdmaDriver destroy HWC";
-        let header = self.wait_for_vf_to_own_shmem(log_ctx);
-        if header.is_none() { return; }
-        else {
-            if !header.is_response() {
-                tracing::error!("{}: expected response", log_ctx);
-            }
-            if header.status() != 0 {
-                tracing::error!("{} DESTROY_HWC failed: {}", log_ctx, header.status());
-            }
+        let header = match self.wait_for_vf_to_own_shmem(log_ctx) {
+            Some(hdr) => hdr,
+            None => { return; }
+        };
+        if !header.is_response() {
+            tracing::error!("{}: expected response", log_ctx);
+        }
+        if header.status() != 0 {
+            tracing::error!("{} DESTROY_HWC failed: {}", log_ctx, header.status());
         }
     }
 }
