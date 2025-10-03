@@ -815,8 +815,18 @@ impl PrimaryChannelState {
         let rss_state = rss_state
             .map(|rss| {
                 if rss.indirection_table.len() != indirection_table_size as usize {
+                    tracing::error!(
+                        saved_table_size = rss.indirection_table.len(),
+                        expected_table_size = indirection_table_size,
+                        "RSS indirection table size mismatch during restore"
+                    );
                     return Err(NetRestoreError::MismatchedIndirectionTableSize);
                 }
+                tracing::info!(
+                    key_size = rss.key.len(),
+                    indirection_table_size = rss.indirection_table.len(),
+                    "RSS state successfully restored from saved state"
+                );
                 Ok(RssState {
                     key: rss
                         .key
@@ -3233,6 +3243,13 @@ impl Adapter {
                 )?;
             }
             rndisprot::Oid::OID_GEN_RECEIVE_SCALE_CAPABILITIES => {
+                tracing::info!(
+                    max_queues = self.max_queues,
+                    interrupt_messages = 1,
+                    indirection_table_size = self.indirection_table_size,
+                    "Windows querying RSS capabilities - advertising multi-queue support"
+                );
+
                 writer.write(
                     &rndisprot::NdisReceiveScaleCapabilities {
                         header: rndisprot::NdisObjectHeader {
@@ -3292,12 +3309,14 @@ impl Adapter {
                 // TODO
             }
             rndisprot::Oid::OID_GEN_RECEIVE_SCALE_PARAMETERS => {
+                tracing::info!("Windows setting up RSS parameters - configuring multi-queue");
                 self.oid_set_rss_parameters(reader, primary)?;
 
                 // Endpoints cannot currently change RSS parameters without
                 // being restarted. This was a limitation driven by some DPDK
                 // PMDs, and should be fixed.
                 restart_endpoint = true;
+                tracing::info!("RSS parameters configured - endpoint restart triggered");
             }
             _ => {
                 tracelimit::warn_ratelimited!(?oid, "set of unknown OID");
@@ -3317,17 +3336,36 @@ impl Adapter {
         let len = reader.len().min(size_of_val(&params));
         reader.clone().read(&mut params.as_mut_bytes()[..len])?;
 
+        tracing::info!(
+            flags = params.flags,
+            hash_information = params.hash_information,
+            hash_secret_key_size = params.hash_secret_key_size,
+            indirection_table_size = params.indirection_table_size,
+            max_queues = self.max_queues,
+            "Windows RSS parameter details"
+        );
+
         if ((params.flags & NDIS_RSS_PARAM_FLAG_DISABLE_RSS) != 0)
             || ((params.hash_information & NDIS_HASH_FUNCTION_MASK) == 0)
         {
+            tracing::info!("Windows disabling RSS - reverting to single queue");
             primary.rss_state = None;
             return Ok(());
         }
 
         if params.hash_secret_key_size != 40 {
+            tracing::error!(
+                provided_key_size = params.hash_secret_key_size,
+                expected_key_size = 40,
+                "RSS hash secret key size validation failed"
+            );
             return Err(OidError::InvalidInput("hash_secret_key_size"));
         }
         if params.indirection_table_size % 4 != 0 {
+            tracing::error!(
+                indirection_table_size = params.indirection_table_size,
+                "RSS indirection table size must be multiple of 4"
+            );
             return Err(OidError::InvalidInput("indirection_table_size"));
         }
         let indirection_table_size =
@@ -3342,10 +3380,23 @@ impl Adapter {
             .skip(params.indirection_table_offset as usize)?
             .read(indirection_table[..indirection_table_size].as_mut_bytes())?;
         tracelimit::info_ratelimited!(?indirection_table, "OID_GEN_RECEIVE_SCALE_PARAMETERS");
+
+        tracing::info!(
+            indirection_table_size = indirection_table_size,
+            max_queues = self.max_queues,
+            key_size = key.len(),
+            "RSS indirection table and key validation"
+        );
+
         if indirection_table
             .iter()
             .any(|&x| x >= self.max_queues as u32)
         {
+            tracing::error!(
+                max_queue_index = indirection_table.iter().max(),
+                max_allowed = self.max_queues,
+                "RSS indirection table contains invalid queue indices"
+            );
             return Err(OidError::InvalidInput("indirection_table"));
         }
         let (indir_init, indir_uninit) = indirection_table.split_at_mut(indirection_table_size);
@@ -3359,6 +3410,13 @@ impl Adapter {
             key,
             indirection_table: indirection_table.iter().map(|&x| x as u16).collect(),
         });
+
+        tracing::info!(
+            indirection_table_size = indirection_table_size,
+            actual_queues_used = indirection_table.iter().max().unwrap_or(&0) + 1,
+            "Windows RSS configured successfully - indirection table created"
+        );
+
         Ok(())
     }
 
@@ -4114,26 +4172,36 @@ impl Coordinator {
         self.buffers = Some(state.buffers.clone());
 
         let num_queues = state.state.primary.as_ref().unwrap().requested_num_queues;
+
+        let primary = state.state.primary.as_mut().unwrap();
+
+        // Log the RSS state and queue allocation decision
+        let rss_configured = primary.rss_state.is_some();
+        tracing::info!(
+            num_queues,
+            rss_configured,
+            "Endpoint restart - queue allocation for RSS"
+        );
+
         let mut active_queues = Vec::new();
-        let active_queue_count =
-            if let Some(rss_state) = state.state.primary.as_ref().unwrap().rss_state.as_ref() {
-                // Active queue count is computed as the number of unique entries in the indirection table
-                active_queues.clone_from(&rss_state.indirection_table);
-                active_queues.sort();
-                active_queues.dedup();
-                active_queues = active_queues
-                    .into_iter()
-                    .filter(|&index| index < num_queues)
-                    .collect::<Vec<_>>();
-                if !active_queues.is_empty() {
-                    active_queues.len() as u16
-                } else {
-                    tracelimit::warn_ratelimited!("Invalid RSS indirection table");
-                    num_queues
-                }
+        let active_queue_count = if let Some(rss_state) = primary.rss_state.as_ref() {
+            // Active queue count is computed as the number of unique entries in the indirection table
+            active_queues.clone_from(&rss_state.indirection_table);
+            active_queues.sort();
+            active_queues.dedup();
+            active_queues = active_queues
+                .into_iter()
+                .filter(|&index| index < num_queues)
+                .collect::<Vec<_>>();
+            if !active_queues.is_empty() {
+                active_queues.len() as u16
             } else {
+                tracelimit::warn_ratelimited!("Invalid RSS indirection table");
                 num_queues
-            };
+            }
+        } else {
+            num_queues
+        };
 
         // Distribute the rx buffers to only the active queues.
         let (ranges, mut remote_buffer_id_recvs) =
@@ -4256,12 +4324,25 @@ impl Coordinator {
 
             assert_eq!(queues.len(), num_queues as usize);
 
+            // Log successful queue allocation
+            tracing::info!(
+                allocated_queues = queues.len(),
+                subchannels = num_queues - 1,
+                rss_active = rss.is_some(),
+                "Successfully allocated queues for RSS"
+            );
+
             // Set the subchannel count.
             self.channel_control
                 .enable_subchannels(num_queues - 1)
                 .expect("already validated");
 
             self.num_queues = num_queues;
+
+            tracing::info!(
+                total_queues = self.num_queues,
+                "Multi-queue networking ready - RSS should now be active"
+            );
         }
 
         // Provide the queue and receive buffer ranges for each worker.
@@ -5094,7 +5175,14 @@ impl<T: 'static + RingMem> NetChannel<T> {
                         protocol::Status::FAILURE
                     };
 
-                    tracing::debug!(?status, subchannel_count, "subchannel request");
+                    tracing::info!(
+                        ?status,
+                        subchannel_count,
+                        requested = request.num_sub_channels,
+                        max_allowed = self.adapter.max_queues,
+                        operation = ?request.operation,
+                        "Windows subchannel request for RSS queues"
+                    );
                     self.send_completion(
                         packet.transaction_id,
                         &self
@@ -5113,6 +5201,12 @@ impl<T: 'static + RingMem> NetChannel<T> {
                         primary.requested_num_queues = subchannel_count as u16 + 1;
                         primary.tx_spread_sent = false;
                         self.restart = Some(CoordinatorMessage::Restart);
+
+                        tracing::info!(
+                            total_queues = primary.requested_num_queues,
+                            subchannels = subchannel_count,
+                            "Windows successfully allocated subchannels - restarting endpoint for multi-queue"
+                        );
                     }
                 }
                 PacketData::RevokeReceiveBuffer(Message1RevokeReceiveBuffer { id })
