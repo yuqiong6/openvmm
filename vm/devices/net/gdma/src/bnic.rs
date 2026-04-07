@@ -153,8 +153,17 @@ impl BufferAccess for GuestBuffers {
     }
 }
 
+/// Configuration for the emulated BNIC device.
+#[derive(Default)]
+pub struct BnicConfig {
+    /// Adapter link speed in megabits per second.
+    /// When 0, the host-side MANA stack reports a 200 Gbps fallback value.
+    pub adapter_link_speed_mbps: u32,
+}
+
 pub struct BasicNic {
     vports: Vec<Vport>,
+    config: BnicConfig,
 }
 
 impl InspectMut for BasicNic {
@@ -191,7 +200,7 @@ struct QueueCfg {
 }
 
 impl BasicNic {
-    pub fn new(vports: Vec<VportConfig>) -> Self {
+    pub fn new(vports: Vec<VportConfig>, config: BnicConfig) -> Self {
         assert!(!vports.is_empty());
 
         let vports = vports
@@ -213,7 +222,7 @@ impl BasicNic {
             )
             .collect();
 
-        Self { vports }
+        Self { vports, config }
     }
 
     pub async fn handle_req(
@@ -239,10 +248,21 @@ impl BasicNic {
                     max_num_vports: self.vports.len() as u16,
                     reserved: 0,
                     max_num_eqs: 64,
+                    adapter_mtu: 0,
+                    reserved2: 0,
+                    adapter_link_speed_mbps: self.config.adapter_link_speed_mbps,
                 };
 
-                write.write(resp.as_bytes())?;
-                size_of_val(&resp)
+                // Match socmana behavior by zeroing response buffer before
+                // writing truncated response
+                let resp_bytes = resp.as_bytes();
+                let guest_resp_size = MemoryWrite::len(&write);
+                let mut zero_write = write.clone();
+                let zeros = vec![0u8; resp_bytes.len()];
+                zero_write.write(&zeros)?;
+                let write_len = guest_resp_size.min(resp_bytes.len());
+                write.write(&resp_bytes[..write_len])?;
+                write_len
             }
             ManaCommandCode::MANA_CONFIG_VPORT_TX => {
                 let req: ManaConfigVportReq = read
