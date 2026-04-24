@@ -1320,20 +1320,6 @@ impl VmbusDevice for Nic {
         {
             let worker = &mut self.coordinator.state_mut().unwrap().workers[channel_idx as usize];
             worker.stop().await;
-            if let Some(worker_state) = worker.state_mut() {
-                // Send TX completions for all pending TX packets before
-                // removing the worker.
-                let ready = match &mut worker_state.state {
-                    WorkerState::Ready(ready) => Some(ready),
-                    WorkerState::WaitingForCoordinator(ready) => ready.as_mut(),
-                    WorkerState::Init(_) => None,
-                };
-                if let Some(ready) = ready {
-                    worker_state
-                        .channel
-                        .complete_pending_tx_on_close(&mut ready.state);
-                }
-            }
             if worker.has_state() {
                 worker.remove();
             }
@@ -2414,8 +2400,7 @@ impl<T: RingMem> NetChannel<T> {
             .ok_or(WorkerError::NotSupportedOnSubChannel(message_type))?;
 
         if message_type == rndisprot::MESSAGE_TYPE_HALT_MSG {
-            tracelimit::info_ratelimited!("received RNDIS halt message");
-            control.rndis_state = RndisState::Halted;
+            // Currently ignored and does not require a response.
             return Ok(());
         }
 
@@ -5478,18 +5463,6 @@ impl<T: 'static + RingMem> NetChannel<T> {
             did_some_work = true;
             match packet.data {
                 PacketData::RndisPacket(_) => {
-                    // If the RNDIS state is halted, skip processing and
-                    // immediately complete the packet.
-                    if state
-                        .primary
-                        .as_ref()
-                        .is_some_and(|p| p.rndis_state == RndisState::Halted)
-                    {
-                        tracelimit::info_ratelimited!("RNDIS halted, completing packet without processing");
-                        self.send_completion(packet.transaction_id, None)?;
-                        continue;
-                    }
-
                     let id = state.free_tx_packets.pop().unwrap();
                     let result: Result<usize, WorkerError> =
                         self.handle_rndis(buffers, id, state, &packet, &mut data.tx_segments);
@@ -5498,17 +5471,6 @@ impl<T: 'static + RingMem> NetChannel<T> {
                             total_packets += num_packets as u64;
                             if num_packets == 0 {
                                 self.complete_tx_packet(state, id, protocol::Status::SUCCESS)?;
-                            }
-                            // If a halt message was processed, complete all
-                            // pending TX packets and stop processing further
-                            // RNDIS messages.
-                            if state
-                                .primary
-                                .as_ref()
-                                .is_some_and(|p| p.rndis_state == RndisState::Halted)
-                            {
-                                self.complete_pending_tx_on_close(state);
-                                break;
                             }
                         }
                         Err(err) => {
@@ -5799,33 +5761,6 @@ impl<T: 'static + RingMem> NetChannel<T> {
             });
         }
         Ok(())
-    }
-
-    /// Sends TX completions for all pending TX packets on channel close.
-    ///
-    /// This handles both in-flight packets (submitted to the endpoint but not
-    /// yet completed) and already-queued completions that haven't been written
-    /// to the ring yet.
-    fn complete_pending_tx_on_close(&mut self, state: &mut ActiveState) {
-        // Complete any in-flight TX packets that were submitted to the endpoint.
-        for (id, inflight) in state.pending_tx_packets.iter_mut().enumerate() {
-            if inflight.pending_packet_count > 0 {
-                inflight.pending_packet_count = 0;
-                state.pending_tx_completions.push_back(PendingTxCompletion {
-                    transaction_id: inflight.transaction_id,
-                    tx_id: Some(TxId(id as u32)),
-                    status: protocol::Status::SUCCESS,
-                });
-            }
-        }
-
-        // Send all pending TX completions to the guest.
-        self.pending_send_size = 0;
-        while let Some(pending) = state.pending_tx_completions.front() {
-            tracelimit::info_ratelimited!("completing pending Tx packets on halt");
-            let _ = self.try_send_tx_packet(pending.transaction_id, pending.status);
-            state.pending_tx_completions.pop_front();
-        }
     }
 }
 
