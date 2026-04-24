@@ -1320,6 +1320,19 @@ impl VmbusDevice for Nic {
         {
             let worker = &mut self.coordinator.state_mut().unwrap().workers[channel_idx as usize];
             worker.stop().await;
+            // Flush any pending TX completions into the guest ring before
+            // tearing down the worker state. See `flush_tx_on_close` for
+            // rationale.
+            if let Some(w) = worker.state_mut() {
+                let ready = match &mut w.state {
+                    WorkerState::Ready(ready) => Some(ready),
+                    WorkerState::WaitingForCoordinator(ready) => ready.as_mut(),
+                    WorkerState::Init(_) => None,
+                };
+                if let Some(ready) = ready {
+                    w.channel.flush_tx_on_close(&mut ready.state);
+                }
+            }
             if worker.has_state() {
                 worker.remove();
             }
@@ -5761,6 +5774,49 @@ impl<T: 'static + RingMem> NetChannel<T> {
             });
         }
         Ok(())
+    }
+
+    /// Flush any TX completions that are pending delivery to the guest ring,
+    /// to be called on channel close.
+    ///
+    /// On channel close (e.g. host-initiated revoke via `nic_shutdown`), the
+    /// guest's netvsc driver may be blocked in its rescind handler waiting for
+    /// outstanding TX completions to come back. Without delivering those,
+    /// Linux's `rndis_filter_device_remove` sits indefinitely in D-state on
+    /// the `hv_vmbus_rescind` workqueue, which in turn blocks the next
+    /// add-nics by preventing the channel from being released and re-offered.
+    ///
+    /// This must only be called after the worker's processing loop has
+    /// stopped, so that no other path will observe the synthesized
+    /// `pending_packet_count == 0`. Any completions the endpoint later
+    /// delivers will be dropped on the floor along with the rest of the
+    /// worker state when the channel is removed.
+    fn flush_tx_on_close(&mut self, state: &mut ActiveState) {
+        // Synthesize SUCCESS completions for any TX packets that were
+        // submitted to the endpoint but have not yet been completed. Their
+        // actual completion may never arrive if the endpoint is about to be
+        // torn down.
+        for (id, inflight) in state.pending_tx_packets.iter_mut().enumerate() {
+            if inflight.pending_packet_count > 0 {
+                inflight.pending_packet_count = 0;
+                state.pending_tx_completions.push_back(PendingTxCompletion {
+                    transaction_id: inflight.transaction_id,
+                    tx_id: Some(TxId(id as u32)),
+                    status: protocol::Status::SUCCESS,
+                });
+            }
+        }
+
+        // Drain any queued completions into the ring, respecting
+        // ring-full backpressure. If the ring is full we stop; the guest
+        // has already stopped draining by this point in the teardown.
+        self.pending_send_size = 0;
+        if let Err(err) = self.send_pending_packets(state) {
+            tracelimit::warn_ratelimited!(
+                error = &err as &dyn std::error::Error,
+                "failed to flush TX completions on close"
+            );
+        }
     }
 }
 
