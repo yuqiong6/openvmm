@@ -82,17 +82,29 @@ impl<T: DeviceBacking> ManaDevice<T> {
         mana_state: Option<&ManaDeviceSavedState>,
     ) -> anyhow::Result<Self> {
         let mut gdma = if let Some(mana_state) = mana_state {
+            // [G12] ManaDevice::new restore branch.
+            tracing::info!(
+                base_pfn = mana_state.gdma.mem.base_pfn,
+                "[G12] ManaDevice::new restore branch: re-attaching pending DMA buffers"
+            );
             let memory = device.dma_client().attach_pending_buffers()?;
+            tracing::info!(
+                pending_buffer_count = memory.len(),
+                "[G12] attach_pending_buffers complete"
+            );
             let gdma_memory = memory
                 .iter()
                 .find(|m| m.pfns()[0] == mana_state.gdma.mem.base_pfn)
                 .expect("gdma restored memory not found")
                 .clone();
 
+            // [G13] GdmaDriver::restore.
+            tracing::info!("[G13] calling GdmaDriver::restore");
             GdmaDriver::restore(mana_state.gdma.clone(), device, gdma_memory)
                 .instrument(tracing::info_span!("restore_gdma_driver"))
                 .await?
         } else {
+            tracing::info!("[G12] ManaDevice::new cold-init branch");
             GdmaDriver::new(driver, device, num_vps, None)
                 .instrument(tracing::info_span!("new_gdma_driver"))
                 .await?
@@ -111,12 +123,20 @@ impl<T: DeviceBacking> ManaDevice<T> {
             .context("no mana device found")?;
 
         let dev_data = if let Some(mana_state) = mana_state {
+            // [G14] Skip device-registration handshake; reuse pdid/mkey/db_id.
+            tracing::info!(
+                pdid = mana_state.gdma.pdid,
+                gpa_mkey = mana_state.gdma.gpa_mkey,
+                db_id = mana_state.gdma.db_id,
+                "[G14] reusing pdid/gpa_mkey/db_id from saved state (no register_device RPC)"
+            );
             GdmaRegisterDeviceResp {
                 pdid: mana_state.gdma.pdid,
                 gpa_mkey: mana_state.gdma.gpa_mkey,
                 db_id: mana_state.gdma.db_id as u32,
             }
         } else {
+            tracing::info!("[G14] cold-init: issuing register_device RPC");
             gdma.register_device(dev_id).await?
         };
 
@@ -173,24 +193,39 @@ impl<T: DeviceBacking> ManaDevice<T> {
 
     /// Saves the device's state for servicing
     pub async fn save(self) -> (anyhow::Result<ManaDeviceSavedState>, T) {
-        self.inspect_task.cancel().await;
-        if let Some(hwc_task) = self.hwc_task {
-            hwc_task.cancel().await;
-        }
-        let inner = Arc::into_inner(self.inner).unwrap();
-        let mut driver = inner.gdma.into_inner();
+        async move {
+            // [C10] ManaDevice::save begin.
+            tracing::info!("[C10] ManaDevice::save: begin");
 
-        if let Ok(saved_state) = driver.save().await {
-            let mana_saved_state = ManaDeviceSavedState { gdma: saved_state };
+            self.inspect_task.cancel().await;
+            tracing::debug!("[C10] inspect_task cancelled");
+            if let Some(hwc_task) = self.hwc_task {
+                hwc_task.cancel().await;
+                tracing::debug!("[C10] hwc_task cancelled");
+            }
+            let inner = Arc::into_inner(self.inner).unwrap();
+            let mut driver = inner.gdma.into_inner();
 
-            (Ok(mana_saved_state), driver.into_device())
-        } else {
-            tracing::error!("Failed to save MANA device state");
-            (
-                Err(anyhow::anyhow!("Failed to save MANA device state")),
-                driver.into_device(),
-            )
+            if let Ok(saved_state) = driver.save().await {
+                tracing::info!(
+                    base_pfn = saved_state.mem.base_pfn,
+                    pdid = saved_state.pdid,
+                    db_id = saved_state.db_id,
+                    "[C10] ManaDevice::save complete (GDMA state captured)"
+                );
+                let mana_saved_state = ManaDeviceSavedState { gdma: saved_state };
+
+                (Ok(mana_saved_state), driver.into_device())
+            } else {
+                tracing::error!("[C10] Failed to save MANA device state");
+                (
+                    Err(anyhow::anyhow!("Failed to save MANA device state")),
+                    driver.into_device(),
+                )
+            }
         }
+        .instrument(tracing::info_span!("mana_device_save"))
+        .await
     }
 
     /// Returns the number of vports the device supports.

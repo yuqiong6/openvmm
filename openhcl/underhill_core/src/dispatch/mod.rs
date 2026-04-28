@@ -422,6 +422,9 @@ impl LoadedVm {
                     }
                 },
                 Event::ServicingRequest(message) => {
+                    // [A2] Run-loop received GuestSaveRequest from the host.
+                    tracing::info!(CVM_ALLOWED, "[A2] Event::ServicingRequest received");
+
                     // Explicitly destructure the message for easier tracking of its changes.
                     let GuestSaveRequest {
                         correlation_id,
@@ -429,6 +432,17 @@ impl LoadedVm {
                         capabilities_flags,
                     } = message;
 
+                    // [A1] GuestSaveRequest fields decoded.
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        correlation_id = %correlation_id,
+                        timeout_hint_ms = timeout_hint.as_millis() as u64,
+                        host_nvme_keepalive = capabilities_flags.enable_nvme_keepalive(),
+                        host_mana_keepalive = capabilities_flags.enable_mana_keepalive(),
+                        "[A1] GuestSaveRequest decoded"
+                    );
+
+                    // [A3] Normalize timeout_hint.
                     // If the host provided timeout hint is >= uint16::max
                     // seconds, we treat that as a signal from the host that no
                     // timeout duration was set. We instead limit servicing to
@@ -436,7 +450,7 @@ impl LoadedVm {
                     let timeout_hint = if timeout_hint >= Duration::from_secs(u16::MAX as u64) {
                         tracing::info!(
                             CVM_ALLOWED,
-                            "host provided UINT16_MAX timeout hint, defaulting to 200s"
+                            "[A3] host provided UINT16_MAX timeout hint, defaulting to 200s"
                         );
                         Duration::from_secs(200)
                     } else {
@@ -449,7 +463,7 @@ impl LoadedVm {
                         correlation_id = %correlation_id,
                         timeout_hint_ms = timeout_hint.as_millis() as u64,
                         servicing_deadline = ?servicing_deadline,
-                        "received servicing request from host"
+                        "[A3] received servicing request from host"
                     );
 
                     match self
@@ -588,10 +602,19 @@ impl LoadedVm {
                 Ok(state)
             }) {
             Ok(state) => {
+                // [E2] Send servicing state blob to host.
+                let encoded = mesh::payload::encode(state);
+                tracing::info!(
+                    CVM_ALLOWED,
+                    encoded_len = encoded.len(),
+                    "[E2] sending servicing state to host"
+                );
                 self.get_client
-                    .send_servicing_state(mesh::payload::encode(state))
+                    .send_servicing_state(encoded)
                     .await?;
 
+                // [E3] Servicing state delivered; awaiting host kexec.
+                tracing::info!(CVM_ALLOWED, "[E3] servicing state sent; host will kexec");
                 true
             }
             Err(err) => {
@@ -621,9 +644,24 @@ impl LoadedVm {
         deadline: std::time::Instant,
         capabilities_flags: SaveGuestVtl2StateFlags,
     ) -> anyhow::Result<ServicingState> {
+        // [A4] Dispatched into handle_servicing_inner.
+        tracing::info!(
+            CVM_ALLOWED,
+            correlation_id = %correlation_id,
+            "[A4] handle_servicing_inner: begin"
+        );
+
         if self.isolation.is_isolated() {
+            // [A6] Refuse on isolated VMs.
+            tracing::error!(
+                CVM_ALLOWED,
+                "[A6] refusing servicing: isolated VMs are not yet supported"
+            );
             anyhow::bail!("Servicing is not yet supported for isolated VMs");
         }
+
+        // [A7] Spawn the timeout watchdog.
+        tracing::info!(CVM_ALLOWED, "[A7] spawning servicing-timeout watchdog");
 
         // Start a servicing timeout thread on its own executor in a new thread.
         // Do this to avoid any tasks that may block the current threadpool
@@ -663,6 +701,9 @@ impl LoadedVm {
                     panic!("servicing operation timed out");
                 });
 
+        // [A8] Capability gate: downgrade keepalive modes if the host did not
+        // advertise support. Env var sets the initial mode at boot; this step
+        // combines that with the per-servicing host capability bits.
         // NOTE: This is set via the corresponding env arg, as this feature is
         // experimental.
         if !capabilities_flags.enable_nvme_keepalive() {
@@ -673,8 +714,20 @@ impl LoadedVm {
             self.mana_keep_alive = KeepAliveConfig::Disabled
         };
 
+        // [A8] Final keepalive modes after host-capability gate.
+        tracing::info!(
+            CVM_ALLOWED,
+            host_nvme_keepalive = capabilities_flags.enable_nvme_keepalive(),
+            host_mana_keepalive = capabilities_flags.enable_mana_keepalive(),
+            effective_nvme_keepalive = self.nvme_keep_alive.as_str(),
+            effective_mana_keepalive = self.mana_keep_alive.as_str(),
+            "[A8] keepalive capability gates resolved"
+        );
+
         // Do everything before the log flush under a span.
         let r = async {
+            // [B1] Quiesce the VM (stop all state units in reverse-dep order).
+            tracing::info!(CVM_ALLOWED, "[B1] stopping VM (quiesce VPs and devices)");
             if !self.stop().await {
                 // This should only occur if you tried to initiate a
                 // servicing operation after manually pausing underhill
@@ -683,9 +736,21 @@ impl LoadedVm {
                 // This is something that we _could_ enable, but it'd
                 // require additional plumbing, so we'll just disallow
                 // this for now.
+                tracing::error!(
+                    CVM_ALLOWED,
+                    "[B1] cannot service underhill while paused"
+                );
                 anyhow::bail!("cannot service underhill while paused");
             }
+            tracing::info!(CVM_ALLOWED, "[B1] VM quiesced");
 
+            // [C] LoadedVm::save begins.
+            tracing::info!(
+                CVM_ALLOWED,
+                nvme_keepalive = self.nvme_keep_alive.as_str(),
+                mana_keepalive = self.mana_keep_alive.as_str(),
+                "[C] LoadedVm::save: begin"
+            );
             let mut state = self
                 .save(
                     Some(deadline),
@@ -694,6 +759,7 @@ impl LoadedVm {
                 )
                 .await?;
             state.init_state.correlation_id = Some(correlation_id);
+            tracing::info!(CVM_ALLOWED, "[C12] ServicingState assembled");
 
             // Unload any network devices.
             let shutdown_mana = async {
@@ -739,14 +805,22 @@ impl LoadedVm {
                     state.init_state.nvme_state.as_ref().map(|n| &n.nvme_state),
                 );
 
+            // [D4] Write per-VP NVMe interrupt state for the next openhcl_boot.
+            tracing::info!(CVM_ALLOWED, "[D4] writing persisted info for next openhcl_boot");
             crate::loader::vtl2_config::write_persisted_info(
                 self.runtime_params.parsed_openhcl_boot(),
                 nvme_vp_interrupt_state,
             )
             .context("failed to write persisted info")?;
 
+            // [D1-D3] Run shutdown_pci || shutdown_mana || shutdown_nvme in parallel.
+            tracing::info!(
+                CVM_ALLOWED,
+                "[D1-D3] running shutdown_pci || shutdown_mana || shutdown_nvme in parallel"
+            );
             let (r, (), ()) = (shutdown_pci, shutdown_mana, shutdown_nvme).join().await;
             r?;
+            tracing::info!(CVM_ALLOWED, "[D1-D3] parallel teardown complete");
 
             Ok(state)
         }
@@ -761,8 +835,9 @@ impl LoadedVm {
             }
         };
 
-        // Tell the initial process to flush all logs. Any logs
+        // [E1] Tell the initial process to flush all logs. Any logs
         // emitted after this point may be lost.
+        tracing::info!(CVM_ALLOWED, "[E1] flushing logs to host (500ms cap)");
         state.init_state.flush_logs_result = Some({
             // Only wait up to a half second (which is still
             // a long time!) to prevent delays from
@@ -818,9 +893,14 @@ impl LoadedVm {
     }
 
     async fn start(&mut self, correlation_id: Option<Guid>) {
+        // [I2] state_units.start in dependency order — VPs and devices begin executing.
+        tracing::info!(
+            CVM_ALLOWED,
+            "[I2] state_units.start: VPs and devices begin executing"
+        );
         self.state_units.start().await;
 
-        // Log the boot/blackout time.
+        // [I4] Log boot/blackout time.
         let reference_time = ReferenceTime::new(self.partition.reference_time());
         if let Some(stopped) = self.last_state_unit_stop {
             let blackout_time = reference_time.since(stopped);
@@ -830,7 +910,7 @@ impl LoadedVm {
                 blackout_time = blackout_time
                     .map_or_else(|| "unknown".to_string(), |t| format!("{:?}", t))
                     .as_str(),
-                "resuming VM"
+                "[I4] resuming VM"
             );
         } else {
             // Assume we started at reference time 0.
@@ -850,8 +930,10 @@ impl LoadedVm {
     async fn stop(&mut self) -> bool {
         if self.state_units.is_running() {
             self.last_state_unit_stop = Some(ReferenceTime::new(self.partition.reference_time()));
-            tracing::info!(CVM_ALLOWED, "stopping VM");
+            // [B2] StateUnits::stop walks reverse-dep order and dispatches StateRequest::Stop.
+            tracing::info!(CVM_ALLOWED, "[B2] stopping VM (state_units.stop in reverse-dep order)");
             self.state_units.stop().await;
+            tracing::info!(CVM_ALLOWED, "[B5] VPs idle, devices idle, save preconditions met");
             true
         } else {
             false
@@ -879,10 +961,17 @@ impl LoadedVm {
         nvme_keepalive_mode: KeepAliveConfig,
         mana_keepalive_mode: KeepAliveConfig,
     ) -> anyhow::Result<ServicingState> {
+        // [C1] Sanity assertion: state units must be stopped.
         assert!(!self.state_units.is_running());
+        tracing::info!(CVM_ALLOWED, "[C1] state units stopped, beginning save");
 
+        // [C2] Save emuplat state (RTC, PAM, netvsp runtime, adapter index).
+        tracing::info!(CVM_ALLOWED, "[C2] saving emuplat state");
         let emuplat = (self.emuplat_servicing.save()).context("emuplat save failed")?;
+        tracing::info!(CVM_ALLOWED, "[C2] emuplat saved");
 
+        // [C3] Save DMA manager state — must run BEFORE network save so that
+        // persistent allocations stay marked Persisted (not Free).
         // Only save dma manager state if we are expected to keep VF devices
         // alive across save. Otherwise, don't persist the state at all, as
         // there should be no live DMA across save.
@@ -892,14 +981,27 @@ impl LoadedVm {
         let dma_manager_state =
             if nvme_keepalive_mode.is_enabled() || mana_keepalive_mode.is_enabled() {
                 use vmcore::save_restore::SaveRestore;
-                Some(self.dma_manager.save().context("dma_manager save failed")?)
+                let s = self.dma_manager.save().context("dma_manager save failed")?;
+                tracing::info!(
+                    CVM_ALLOWED,
+                    "[C3] dma_manager state saved (persistent VTL2 GPA pool descriptors captured)"
+                );
+                Some(s)
             } else {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    "[C3] dma_manager state NOT saved (no keepalive enabled)"
+                );
                 None
             };
 
-        // Only save NVMe state when there are NVMe controllers and keep alive
-        // was enabled.
+        // [C4] Save NVMe state. Only when NVMe controllers exist and keepalive enabled.
         let nvme_state = if let Some(n) = &self.nvme_manager {
+            tracing::info!(
+                CVM_ALLOWED,
+                nvme_keepalive_enabled = nvme_keepalive_mode.is_enabled(),
+                "[C4] saving NVMe state"
+            );
             // DEVNOTE: A subtlety here is that the act of saving the NVMe state also causes the driver
             // to enter a state where subsequent teardown operations will noop. There is a STRONG
             // correlation between save/restore and keepalive.
@@ -912,20 +1014,48 @@ impl LoadedVm {
                 .await
                 .map(|s| NvmeSavedState { nvme_state: s })
         } else {
+            tracing::info!(CVM_ALLOWED, "[C4] no NVMe manager; skipping");
             None
         };
 
+        // [C5] Save state units (every device + VPs + vmbus etc.).
+        // This is where netvsp Nic::save runs (regardless of keepalive).
+        tracing::info!(CVM_ALLOWED, "[C5] save_units begin");
         let units = self.save_units().await.context("state unit save failed")?;
+        tracing::info!(
+            CVM_ALLOWED,
+            unit_count = units.len(),
+            "[C5] save_units complete"
+        );
 
+        // [C7] Save MANA network state (PR #2123). Only when keepalive on.
         let mana_state = if let Some(network_settings) = &mut self.network_settings
             && mana_keepalive_mode.is_enabled()
         {
-            Some(network_settings.save().await)
+            tracing::info!(CVM_ALLOWED, "[C7] saving MANA network state for keepalive");
+            let saved = network_settings
+                .save()
+                .instrument(tracing::info_span!("mana_network_save", CVM_ALLOWED))
+                .await;
+            tracing::info!(
+                CVM_ALLOWED,
+                saved_nic_count = saved.len(),
+                "[C7] MANA network state saved"
+            );
+            Some(saved)
         } else {
+            tracing::info!(
+                CVM_ALLOWED,
+                has_network_settings = self.network_settings.is_some(),
+                mana_keepalive_enabled = mana_keepalive_mode.is_enabled(),
+                "[C7] skipping MANA network save"
+            );
             None
         };
 
+        // [C6] VMGS save and VMBus client save.
         let vmgs = if let Some((vmgs_thin_client, vmgs_disk_metadata, _)) = self.vmgs.as_ref() {
+            tracing::info!(CVM_ALLOWED, "[C6] saving VMGS state");
             Some((
                 vmgs_thin_client.save().await.context("vmgs save failed")?,
                 vmgs_disk_metadata.clone(),
@@ -935,6 +1065,7 @@ impl LoadedVm {
         };
 
         let vmbus_client = if let Some(vmbus_client) = &mut self.vmbus_client {
+            tracing::info!(CVM_ALLOWED, "[C6] saving VMBus client state");
             vmbus_client.stop().await;
             Some(vmbus_client.save().await)
         } else {

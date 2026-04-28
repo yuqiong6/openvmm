@@ -497,7 +497,7 @@ impl UnderhillVmWorker {
                 .context("failed to create thread pool")?
         };
 
-        // In a servicing scenario where the saved state is held on the VM host,
+        // [F3] In a servicing scenario where the saved state is held on the VM host,
         // we only know that saved state exists after we get the DPS information.
         let saved_state_from_host = dps.general.is_servicing_scenario;
 
@@ -514,11 +514,13 @@ impl UnderhillVmWorker {
                 future::pending::<()>().await;
             }
 
+            // [F3] Detected post-servicing scenario.
             tracing::info!(
                 CVM_ALLOWED,
-                "VTL2 restart, getting servicing state from the host"
+                "[F3] VTL2 restart detected, getting servicing state from the host"
             );
 
+            // [F4] Pull saved state from host.
             let saved_state_buf = get_client
                 .get_saved_state_from_host()
                 .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
@@ -533,11 +535,13 @@ impl UnderhillVmWorker {
             tracing::info!(
                 CVM_ALLOWED,
                 saved_state_len = saved_state_buf.len(),
-                "received servicing state from host"
+                "[F4] received servicing state from host"
             );
         }
 
         if let Some(state) = &mut servicing_state {
+            // [F5] Schema migration for older blobs.
+            tracing::info!(CVM_ALLOWED, "[F5] running fix_post_restore (schema migrate)");
             state
                 .fix_post_restore()
                 .context("failed to fix up servicing state on restore")?;
@@ -577,6 +581,12 @@ impl UnderhillVmWorker {
 
         // Restore state units
         if let Some(unit_state) = servicing_unit_state {
+            // [H1] Replay per-unit saved state in dependency order.
+            tracing::info!(
+                CVM_ALLOWED,
+                unit_count = unit_state.len(),
+                "[H1] restore_units: begin"
+            );
             let r = vm
                 .restore_units(unit_state)
                 .instrument(tracing::info_span!(
@@ -586,15 +596,22 @@ impl UnderhillVmWorker {
                 ))
                 .await;
 
+            // [H5] Notify host of restore result.
             // If we received saved state from the host then notify the host
             // that servicing was successful.
             //
             // TODO: send error string to host.
             if saved_state_from_host {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    success = r.is_ok(),
+                    "[H5] reporting restore result to host"
+                );
                 get_client.report_restore_result_to_host(r.is_ok()).await;
             }
 
             r.context("failed to restore")?;
+            tracing::info!(CVM_ALLOWED, "[H1] restore_units complete");
         }
 
         Ok(Self {
@@ -1069,10 +1086,27 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
     }
 
     async fn save(&mut self) -> Vec<ManaSavedState> {
+        // [C7a] Drain vf_managers.
         let mut vf_managers: Vec<(Guid, Arc<HclNetworkVFManager>)> =
             self.vf_managers.drain().collect();
-        let (vf_managers, mut nic_channels) = self.begin_vf_teardown(&mut vf_managers, false);
+        let total = vf_managers.len();
+        tracing::info!(
+            CVM_ALLOWED,
+            vf_manager_count = total,
+            "[C7a] UhVmNetworkSettings::save begin: drained vf_managers"
+        );
 
+        // [C7b] Begin VF teardown — sends ShutdownBegin to each worker actor.
+        let (vf_managers, mut nic_channels) = self.begin_vf_teardown(&mut vf_managers, false);
+        tracing::info!(
+            CVM_ALLOWED,
+            nic_channel_count = nic_channels.len(),
+            vf_manager_count = vf_managers.len(),
+            "[C7b] begin_vf_teardown complete"
+        );
+
+        // [C7c] Revoke and shutdown NIC channels in parallel.
+        tracing::info!(CVM_ALLOWED, "[C7c] revoking and shutting down NIC channels");
         let mut endpoints: Vec<_> =
             join_all(nic_channels.drain(..).map(async |(instance_id, channel)| {
                 async {
@@ -1095,6 +1129,11 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
             }
         };
 
+        // [C7d] Race endpoint pump against per-VF-manager save.
+        tracing::info!(
+            CVM_ALLOWED,
+            "[C7d] racing endpoint pump against per-VF-manager save"
+        );
         let save_vf_managers = join_all(
             vf_managers
                 .into_iter()
@@ -1104,7 +1143,14 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
         let state = (run_endpoints, save_vf_managers).race().await;
 
         // Discard any vf_managers that failed to return valid save state.
-        state.into_iter().flatten().collect()
+        let saved: Vec<ManaSavedState> = state.into_iter().flatten().collect();
+        tracing::info!(
+            CVM_ALLOWED,
+            requested = total,
+            saved = saved.len(),
+            "[C7d] UhVmNetworkSettings::save complete"
+        );
+        saved
     }
 }
 
@@ -1866,9 +1912,20 @@ async fn new_underhill_vm(
 
     if let Some(dma_manager_state) = servicing_state.dma_manager_state.flatten() {
         use vmcore::save_restore::SaveRestore;
+        // [G3] DMA manager restore — re-attach persistent VTL2 GPA pool.
+        tracing::info!(
+            CVM_ALLOWED,
+            "[G3] restore: re-attaching persistent VTL2 GPA pool from saved dma_manager state"
+        );
         dma_manager
             .restore(dma_manager_state)
             .context("failed to restore global dma manager")?;
+        tracing::info!(CVM_ALLOWED, "[G3] dma_manager restored");
+    } else {
+        tracing::info!(
+            CVM_ALLOWED,
+            "[G3] no dma_manager state in servicing blob (cold init for DMA)"
+        );
     }
 
     // Test with the highest VTL for which we have a GuestMemory object
@@ -3327,12 +3384,32 @@ async fn new_underhill_vm(
     let mut netvsp_state = Vec::with_capacity(controllers.mana.len());
     if !controllers.mana.is_empty() {
         let _span = tracing::info_span!("network_settings", CVM_ALLOWED).entered();
+        // [G7] Restore: instantiate MANA NICs (per-NIC saved-state lookup).
+        tracing::info!(
+            CVM_ALLOWED,
+            nic_count = controllers.mana.len(),
+            saved_mana_nic_count = servicing_state
+                .mana_state
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            mana_keepalive_mode = env_cfg.mana_keep_alive.as_str(),
+            "[G7] restore: instantiating MANA NICs"
+        );
         for nic_config in controllers.mana.into_iter() {
             let nic_servicing_state = if let Some(ref state) = servicing_state.mana_state {
                 state.iter().find(|s| s.pci_id == nic_config.pci_id)
             } else {
                 None
             };
+
+            tracing::info!(
+                CVM_ALLOWED,
+                pci_id = %nic_config.pci_id,
+                instance_id = %nic_config.instance_id,
+                has_saved_state = nic_servicing_state.is_some(),
+                "[G7] per-NIC saved-state lookup"
+            );
 
             let save_state = uh_network_settings
                 .add_network(

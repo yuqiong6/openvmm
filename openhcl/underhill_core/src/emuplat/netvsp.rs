@@ -866,33 +866,47 @@ impl HclNetworkVFManagerWorker {
                     .await;
                 }
                 NextWorkItem::ManagerMessage(HclNetworkVfManagerMessage::SaveState(rpc)) => {
+                    // [C9] Worker actor handles SaveState RPC.
+                    tracing::info!("[C9] worker actor: SaveState received");
                     assert!(self.is_shutdown_active);
                     drop(self.messages.take().unwrap());
                     rpc.handle(async |_| {
+                        tracing::info!("[C9] disconnecting all endpoints");
                         self.disconnect_all_endpoints().await;
 
                         if let Some(device) = self.mana_device.take() {
+                            tracing::info!("[C9] calling ManaDevice::save");
                             let (saved_state, device) = device
                                 .save()
                                 .instrument(tracing::info_span!("saving mana device state"))
                                 .await;
 
+                            // [C9] mem::forget(VfioDevice) — keep VFIO mapping live across kexec.
                             // Closing the VFIO device handle can take a long time.
                             // Leak the handle by stashing it away.
+                            tracing::info!(
+                                "[C9] mem::forget(VfioDevice) to preserve VFIO state across kexec"
+                            );
                             std::mem::forget(device);
 
                             match saved_state {
-                                Ok(saved_state) => VfManagerSaveResult::Saved(ManaSavedState {
-                                    mana_device: saved_state,
-                                    pci_id: self.vtl2_pci_id.clone(),
-                                }),
+                                Ok(saved_state) => {
+                                    tracing::info!(
+                                        pci_id = %self.vtl2_pci_id,
+                                        "[C9] MANA device state saved successfully"
+                                    );
+                                    VfManagerSaveResult::Saved(ManaSavedState {
+                                        mana_device: saved_state,
+                                        pci_id: self.vtl2_pci_id.clone(),
+                                    })
+                                }
                                 Err(_) => {
-                                    tracing::error!("Failed while saving MANA device state");
+                                    tracing::error!("[C9] Failed while saving MANA device state");
                                     VfManagerSaveResult::SaveFailed
                                 }
                             }
                         } else {
-                            tracing::warn!("no MANA device present when saving state");
+                            tracing::warn!("[C9] no MANA device present when saving state");
                             VfManagerSaveResult::DeviceMissing
                         }
                     })
@@ -1281,6 +1295,8 @@ impl HclNetworkVFManager {
     }
 
     pub async fn save(&self) -> Option<ManaSavedState> {
+        // [C8] Send SaveState RPC to the VF manager worker actor.
+        tracing::info!("[C8] HclNetworkVFManager::save sending SaveState RPC");
         let save_state = self
             .shared_state
             .worker_channel
@@ -1288,9 +1304,15 @@ impl HclNetworkVFManager {
             .await;
 
         match save_state {
-            Ok(VfManagerSaveResult::Saved(state)) => Some(state),
+            Ok(VfManagerSaveResult::Saved(state)) => {
+                tracing::info!(
+                    pci_id = %state.pci_id,
+                    "[C8] HclNetworkVFManager::save: Saved"
+                );
+                Some(state)
+            }
             Ok(VfManagerSaveResult::DeviceMissing) => {
-                tracing::warn!("MANA device missing when saving state");
+                tracing::warn!("[C8] MANA device missing when saving state");
                 None
             }
             Ok(VfManagerSaveResult::SaveFailed) => {

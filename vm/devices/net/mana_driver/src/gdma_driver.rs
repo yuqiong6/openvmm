@@ -78,6 +78,7 @@ use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 use user_driver::DeviceBacking;
 use user_driver::DeviceRegisterIo;
 use user_driver::backoff::Backoff;
@@ -524,35 +525,60 @@ impl<T: DeviceBacking> GdmaDriver<T> {
     }
 
     pub async fn save(&mut self) -> anyhow::Result<GdmaDriverSavedState> {
-        if self.hwc_failure {
-            anyhow::bail!("cannot save/restore after HWC failure");
+        let span = tracing::info_span!(
+            "gdma_driver_save",
+            db_id = self.db_id,
+            num_msix = self.num_msix,
+        );
+        async move {
+            // [C11] GdmaDriver::save begin.
+            tracing::info!("[C11] GdmaDriver::save: begin");
+
+            if self.hwc_failure {
+                tracing::warn!("[C11] cannot save/restore after HWC failure");
+                anyhow::bail!("cannot save/restore after HWC failure");
+            }
+
+            if self.vf_reconfiguration_pending {
+                tracing::warn!("[C11] cannot save/restore with VF reconfiguration pending");
+                anyhow::bail!("cannot save/restore with VF reconfiguration pending");
+            }
+
+            self.state_saved = true;
+
+            let doorbell = self.bar0.save(Some(self.db_id as u64));
+
+            let saved = GdmaDriverSavedState {
+                mem: SavedMemoryState {
+                    base_pfn: self.dma_buffer.pfns()[0],
+                    len: self.dma_buffer.len(),
+                },
+                eq: self.eq.save(),
+                cq: self.cq.save(),
+                rq: self.rq.save(),
+                sq: self.sq.save(),
+                db_id: doorbell.doorbell_id,
+                gpa_mkey: self.gpa_mkey,
+                pdid: self._pdid,
+                hwc_activity_id: self.hwc_activity_id,
+                num_msix: self.num_msix,
+                min_queue_avail: self.min_queue_avail,
+                link_toggle: self.link_toggle.clone(),
+            };
+
+            tracing::info!(
+                base_pfn = saved.mem.base_pfn,
+                buffer_len = saved.mem.len,
+                pdid = saved.pdid,
+                gpa_mkey = saved.gpa_mkey,
+                db_id = saved.db_id,
+                "[C11] GdmaDriver::save complete"
+            );
+
+            Ok(saved)
         }
-
-        if self.vf_reconfiguration_pending {
-            anyhow::bail!("cannot save/restore with VF reconfiguration pending");
-        }
-
-        self.state_saved = true;
-
-        let doorbell = self.bar0.save(Some(self.db_id as u64));
-
-        Ok(GdmaDriverSavedState {
-            mem: SavedMemoryState {
-                base_pfn: self.dma_buffer.pfns()[0],
-                len: self.dma_buffer.len(),
-            },
-            eq: self.eq.save(),
-            cq: self.cq.save(),
-            rq: self.rq.save(),
-            sq: self.sq.save(),
-            db_id: doorbell.doorbell_id,
-            gpa_mkey: self.gpa_mkey,
-            pdid: self._pdid,
-            hwc_activity_id: self.hwc_activity_id,
-            num_msix: self.num_msix,
-            min_queue_avail: self.min_queue_avail,
-            link_toggle: self.link_toggle.clone(),
-        })
+        .instrument(span)
+        .await
     }
 
     pub fn init(device: &mut T) -> anyhow::Result<(<T as DeviceBacking>::Registers, RegMap)> {
