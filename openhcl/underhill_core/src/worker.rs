@@ -541,7 +541,10 @@ impl UnderhillVmWorker {
 
         if let Some(state) = &mut servicing_state {
             // [F5] Schema migration for older blobs.
-            tracing::info!(CVM_ALLOWED, "[F5] running fix_post_restore (schema migrate)");
+            tracing::info!(
+                CVM_ALLOWED,
+                "[F5] running fix_post_restore (schema migrate)"
+            );
             state
                 .fix_post_restore()
                 .context("failed to fix up servicing state on restore")?;

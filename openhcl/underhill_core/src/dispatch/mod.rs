@@ -609,9 +609,7 @@ impl LoadedVm {
                     encoded_len = encoded.len(),
                     "[E2] sending servicing state to host"
                 );
-                self.get_client
-                    .send_servicing_state(encoded)
-                    .await?;
+                self.get_client.send_servicing_state(encoded).await?;
 
                 // [E3] Servicing state delivered; awaiting host kexec.
                 tracing::info!(CVM_ALLOWED, "[E3] servicing state sent; host will kexec");
@@ -736,10 +734,7 @@ impl LoadedVm {
                 // This is something that we _could_ enable, but it'd
                 // require additional plumbing, so we'll just disallow
                 // this for now.
-                tracing::error!(
-                    CVM_ALLOWED,
-                    "[B1] cannot service underhill while paused"
-                );
+                tracing::error!(CVM_ALLOWED, "[B1] cannot service underhill while paused");
                 anyhow::bail!("cannot service underhill while paused");
             }
             tracing::info!(CVM_ALLOWED, "[B1] VM quiesced");
@@ -806,7 +801,10 @@ impl LoadedVm {
                 );
 
             // [D4] Write per-VP NVMe interrupt state for the next openhcl_boot.
-            tracing::info!(CVM_ALLOWED, "[D4] writing persisted info for next openhcl_boot");
+            tracing::info!(
+                CVM_ALLOWED,
+                "[D4] writing persisted info for next openhcl_boot"
+            );
             crate::loader::vtl2_config::write_persisted_info(
                 self.runtime_params.parsed_openhcl_boot(),
                 nvme_vp_interrupt_state,
@@ -931,9 +929,15 @@ impl LoadedVm {
         if self.state_units.is_running() {
             self.last_state_unit_stop = Some(ReferenceTime::new(self.partition.reference_time()));
             // [B2] StateUnits::stop walks reverse-dep order and dispatches StateRequest::Stop.
-            tracing::info!(CVM_ALLOWED, "[B2] stopping VM (state_units.stop in reverse-dep order)");
+            tracing::info!(
+                CVM_ALLOWED,
+                "[B2] stopping VM (state_units.stop in reverse-dep order)"
+            );
             self.state_units.stop().await;
-            tracing::info!(CVM_ALLOWED, "[B5] VPs idle, devices idle, save preconditions met");
+            tracing::info!(
+                CVM_ALLOWED,
+                "[B5] VPs idle, devices idle, save preconditions met"
+            );
             true
         } else {
             false
