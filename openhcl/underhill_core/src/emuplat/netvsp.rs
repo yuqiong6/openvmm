@@ -345,7 +345,13 @@ impl HclNetworkVFManagerWorker {
 
     pub async fn connect_endpoints(&mut self) -> anyhow::Result<Vec<MacAddress>> {
         let device = self.mana_device.as_ref().expect("valid endpoint");
-        let indices = (0..device.num_vports()).collect::<Vec<u32>>();
+        let num_vports = device.num_vports();
+        tracing::info!(
+            num_vports,
+            vtl2_pci_id = %self.vtl2_pci_id,
+            "connecting endpoints for MANA vports"
+        );
+        let indices = (0..num_vports).collect::<Vec<u32>>();
         let result = futures::future::try_join_all(
             indices.iter().zip(self.endpoint_controls.iter_mut()).map(
                 |(index, endpoint_control)| {
@@ -1199,7 +1205,14 @@ impl HclNetworkVFManager {
             mana_state,
         )
         .await?;
-        let (mut endpoints, endpoint_controls): (Vec<_>, Vec<_>) = (0..device.num_vports())
+        let num_vports = device.num_vports();
+        tracing::info!(
+            num_vports,
+            %vtl2_vf_instance_id,
+            vtl2_pci_id = %vtl2_pci_id,
+            "HclNetworkVFManager::new: creating one endpoint per MANA vport"
+        );
+        let (mut endpoints, endpoint_controls): (Vec<_>, Vec<_>) = (0..num_vports)
             .map(|_| {
                 let (endpoint, endpoint_control) = DisconnectableEndpoint::new();
                 (Box::new(endpoint), endpoint_control)

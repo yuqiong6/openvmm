@@ -666,6 +666,13 @@ impl StateUnits {
                         "unit {} in {:?} state, should be {:?} or {:?}",
                         unit.name, unit.state, old_state, new_state
                     );
+                    tracing::info!(
+                        device = unit.name.as_ref(),
+                        operation = op,
+                        unit_id = id,
+                        unit_state = ?unit.state,
+                        "skipping state change for unit already in target state"
+                    );
                     ready_set.done(id, true);
                 } else {
                     let name = unit.name.clone();
@@ -673,8 +680,20 @@ impl StateUnits {
                     let ready_set = ready_set.clone();
                     let deps = deps(unit).to_vec();
                     let fut = state_change(name.clone(), unit, request, input);
+                    tracing::info!(
+                        device = name.as_ref(),
+                        operation = op,
+                        unit_id = id,
+                        "scheduling state change for unit"
+                    );
                     let recv = async move {
                         ready_set.wait(op, id, &deps).await;
+                        tracing::info!(
+                            device = name.as_ref(),
+                            operation = op,
+                            unit_id = id,
+                            "starting state change for unit"
+                        );
                         let r = fut.await;
                         ready_set.done(id, true);
                         (name, id, r)

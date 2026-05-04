@@ -143,6 +143,13 @@ impl<T: DeviceBacking> ManaDevice<T> {
         let mut bnic = BnicDriver::new(&mut gdma, dev_id);
         let dev_config = bnic.query_dev_config().await?;
         tracing::info!(mana_dev_config = ?dev_config);
+        tracing::info!(
+            max_num_vports = dev_config.max_num_vports,
+            max_num_eqs = dev_config.max_num_eqs,
+            num_vps,
+            max_queues_per_vport,
+            "MANA device capabilities reported by hardware"
+        );
         let num_queues_needed = dev_config.max_num_vports as u32 * max_queues_per_vport as u32;
         gdma.check_vf_resources(num_vps, num_queues_needed);
 
