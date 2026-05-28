@@ -920,8 +920,27 @@ impl LoadedVm {
         let mana_state = if let Some(network_settings) = &mut self.network_settings
             && mana_keepalive_mode.is_enabled()
         {
-            Some(network_settings.save().await)
+            let saved = network_settings
+                .save()
+                .instrument(tracing::info_span!(
+                    "mana_network_settings_save",
+                    CVM_ALLOWED,
+                    mana_keepalive_mode_enabled = mana_keepalive_mode.is_enabled()
+                ))
+                .await;
+            tracing::info!(
+                CVM_ALLOWED,
+                mana_devices_saved = saved.len(),
+                "MANA keepalive save path complete"
+            );
+            Some(saved)
         } else {
+            tracing::info!(
+                CVM_ALLOWED,
+                mana_keepalive_mode_enabled = mana_keepalive_mode.is_enabled(),
+                network_settings_present = self.network_settings.is_some(),
+                "skipping MANA keepalive save"
+            );
             None
         };
 

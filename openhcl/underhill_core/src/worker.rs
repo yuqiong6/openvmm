@@ -835,6 +835,16 @@ impl UhVmNetworkSettings {
             VfioDmaClients::EphemeralOnly(ephemeral_dma_client)
         };
 
+        tracing::info!(
+            CVM_ALLOWED,
+            pci_id = %nic_config.pci_id,
+            %instance_id,
+            keepalive_mode = ?keepalive_mode,
+            keepalive_enabled = keepalive_mode.is_enabled(),
+            has_saved_mana_state = saved_mana_state.is_some(),
+            "MANA keepalive: creating underhill NIC"
+        );
+
         let (vf_manager, endpoints, save_state) = HclNetworkVFManager::new(
             nic_config.instance_id,
             nic_config.pci_id,

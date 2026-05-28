@@ -524,6 +524,8 @@ impl<T: DeviceBacking> GdmaDriver<T> {
     }
 
     pub async fn save(&mut self) -> anyhow::Result<GdmaDriverSavedState> {
+        tracing::info!("saving gdma driver");
+
         if self.hwc_failure {
             anyhow::bail!("cannot save/restore after HWC failure");
         }
