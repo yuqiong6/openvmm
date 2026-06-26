@@ -444,6 +444,15 @@ impl LoadedVm {
                         capabilities_flags,
                     } = message;
 
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        correlation_id = %correlation_id,
+                        timeout_hint_ms = timeout_hint.as_millis() as u64,
+                        enable_nvme_keepalive = capabilities_flags.enable_nvme_keepalive(),
+                        enable_mana_keepalive = capabilities_flags.enable_mana_keepalive(),
+                        "received guest save request from host"
+                    );
+
                     // If the host provided timeout hint is >= uint16::max
                     // seconds, we treat that as a signal from the host that no
                     // timeout duration was set. We instead limit servicing to
@@ -685,7 +694,19 @@ impl LoadedVm {
         };
 
         if !capabilities_flags.enable_mana_keepalive() {
+            tracing::info!(
+                CVM_ALLOWED,
+                previous_mana_keep_alive = self.mana_keep_alive.as_str(),
+                "host did not advertise MANA keepalive capability; forcing it disabled"
+            );
             self.mana_keep_alive = KeepAliveConfig::Disabled
+        } else {
+            tracing::info!(
+                CVM_ALLOWED,
+                mana_keep_alive = self.mana_keep_alive.as_str(),
+                mana_keep_alive_enabled = self.mana_keep_alive.is_enabled(),
+                "host advertised MANA keepalive capability"
+            );
         };
 
         // Do everything before the log flush under a span.
@@ -701,6 +722,15 @@ impl LoadedVm {
                 anyhow::bail!("cannot service underhill while paused");
             }
 
+            tracing::info!(
+                CVM_ALLOWED,
+                %correlation_id,
+                nvme_keep_alive = self.nvme_keep_alive.as_str(),
+                nvme_keep_alive_enabled = self.nvme_keep_alive.is_enabled(),
+                mana_keep_alive = self.mana_keep_alive.as_str(),
+                mana_keep_alive_enabled = self.mana_keep_alive.is_enabled(),
+                "saving servicing state with keepalive configuration"
+            );
             let mut state = self
                 .save(
                     Some(deadline),

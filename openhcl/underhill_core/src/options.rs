@@ -453,6 +453,11 @@ impl Options {
                         }
                     })
                     .unwrap_or(KeepAliveConfig::Disabled);
+        tracing::info!(
+            mana_keep_alive = mana_keep_alive.as_str(),
+            mana_keep_alive_enabled = mana_keep_alive.is_enabled(),
+            "resolved OPENHCL_MANA_KEEP_ALIVE configuration"
+        );
         let nvme_always_flr = parse_env_bool("OPENHCL_NVME_ALWAYS_FLR");
         let test_configuration = read_env("OPENHCL_TEST_CONFIG").and_then(|x| {
             x.to_string_lossy()

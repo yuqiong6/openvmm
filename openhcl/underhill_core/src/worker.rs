@@ -836,7 +836,18 @@ impl UhVmNetworkSettings {
         // We need a persistent client if keepalive is enabled or if there is a
         // private pool present without keepalive that needs to free previously
         // persisted memory ranges
-        let persistent_dma_client = if keepalive_mode.is_enabled() || saved_mana_state.is_some() {
+        let needs_persistent_dma_client = keepalive_mode.is_enabled() || saved_mana_state.is_some();
+        tracing::info!(
+            CVM_ALLOWED,
+            pci_id = %nic_config.pci_id,
+            %instance_id,
+            keepalive_enabled = keepalive_mode.is_enabled(),
+            has_saved_mana_state = saved_mana_state.is_some(),
+            saved_mana_state_pci_id = saved_mana_state.map(|s| s.pci_id.as_str()),
+            needs_persistent_dma_client,
+            "MANA keepalive: determining persistent DMA client requirement"
+        );
+        let persistent_dma_client = if needs_persistent_dma_client {
             Some(dma_client_spawner.new_client(DmaClientParameters {
                 device_name: format!("nic_{}", nic_config.pci_id),
                 lower_vtl_policy: LowerVtlPermissionPolicy::Any,
@@ -3403,6 +3414,20 @@ async fn new_underhill_vm(
             } else {
                 None
             };
+
+            tracing::info!(
+                CVM_ALLOWED,
+                pci_id = %nic_config.pci_id,
+                instance_id = %nic_config.instance_id,
+                has_servicing_mana_state = servicing_state.mana_state.is_some(),
+                saved_mana_devices = servicing_state
+                    .mana_state
+                    .as_ref()
+                    .map(|s| s.len())
+                    .unwrap_or(0),
+                found_saved_mana_state = nic_servicing_state.is_some(),
+                "MANA keepalive: resolved saved_mana_state for NIC"
+            );
 
             let save_state = uh_network_settings
                 .add_network(
